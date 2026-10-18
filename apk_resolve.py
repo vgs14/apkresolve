@@ -20,8 +20,9 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
-
-
+Latest version available here:
+    https://github.com/vgs14/apkresolve
+    
 Usage:
     python3 apk_resolve.py PKG [PKG ...] \
         --version 3.20 --arch x86_64 --repo main --repo community
@@ -53,7 +54,10 @@ Usage:
 
 Notes:
 - Requires network access to dl-cdn.alpinelinux.org (fetches APKINDEX.tar.gz
-  per repo/arch, caches them locally in ./apkindex_cache/).
+  per repo/arch, caches them locally in ./apkindex_cache/ and revalidates
+  the cache with the server on every run, so it never goes stale).
+- Exits non-zero if any package can't be resolved or fails to download,
+  after reporting every failure.
 - Handles virtual "provides" and so:libfoo.so.N style dependencies, choosing
   the provider apk itself would (highest provider_priority / k: field wins;
   an exact package name always wins over anything merely provided). When a
@@ -86,6 +90,7 @@ import os
 import re
 import sys
 import tarfile
+import urllib.error
 import urllib.request
 
 BASE_URL = "https://dl-cdn.alpinelinux.org/alpine"
@@ -120,61 +125,97 @@ def strip_constraint(token: str) -> str:
     return VERSION_SPLIT_RE.split(token, 1)[0]
 
 
-def fetch_apkindex(version: str, repo: str, arch: str, output_dir: str = None) -> str:
+def write_atomic(path: str, data: bytes):
+    """Write `data` to `path` via a temp file + rename, so an interrupted
+    run can never leave a truncated file behind."""
+    tmp = path + ".tmp"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, path)
+
+
+def fetch_apkindex(version: str, repo: str, arch: str, output_dir: str = None,
+                   frozen: bool = False) -> str:
     """Fetch the APKINDEX (package metadata) for one repo/arch combination
     and return its decoded text content.
 
     Behaviour:
-    - The raw APKINDEX text is cached locally under CACHE_DIR so re-running
-      the script against the same version/repo/arch doesn't re-download it.
-    - If `output_dir` is given, the *original* APKINDEX.tar.gz archive is
-      also copied into `output_dir/v{version}/{repo}/{arch}/APKINDEX.tar.gz`
-      (skipped if already present there), so --output-dir ends up as a
-      self-contained local mirror apk(8) could point at directly.
+    - The raw APKINDEX.tar.gz is cached under CACHE_DIR, along with the
+      server's ETag. Every run revalidates it with a conditional request
+      (If-None-Match): an unchanged index costs a 304 and nothing more,
+      but a changed one is always picked up. Without this, a stale cached
+      index points at package versions dl-cdn has since deleted, and the
+      downloads 404.
+    - If `output_dir` is given, the *same* bytes are copied into
+      `output_dir/v{version}/{repo}/{arch}/APKINDEX.tar.gz` whenever they
+      differ from what's there, so the mirror's index always matches the
+      index the packages were resolved (and downloaded) against.
+    - If `frozen` is True, the cached index is used as-is without asking
+      the server (repeatable builds - see --frozen). It's an error if
+      there's no cached copy yet.
 
     Returns the plain-text contents of the APKINDEX file (not the tar.gz).
     """
-    # Local cache of the *decoded* index text, keyed by version/repo/arch.
     os.makedirs(CACHE_DIR, exist_ok=True)
-    cache_path = os.path.join(CACHE_DIR, f"{version}_{repo}_{arch}_APKINDEX")
+    cache_path = os.path.join(CACHE_DIR, f"{version}_{repo}_{arch}_APKINDEX.tar.gz")
+    etag_path = cache_path + ".etag"
+    url = f"{BASE_URL}/v{version}/{repo}/{arch}/APKINDEX.tar.gz"
 
-    raw_data = None  # holds the raw APKINDEX.tar.gz bytes, if we fetched them this run
-    if not os.path.exists(cache_path):
-        # Not cached yet: download the real archive from dl-cdn.
-        url = f"{BASE_URL}/v{version}/{repo}/{arch}/APKINDEX.tar.gz"
-        sys.stderr.write(f"fetching {url}\n")
-        with urllib.request.urlopen(url) as resp:
+    if frozen:
+        if not os.path.exists(cache_path):
+            sys.exit(f"ERROR: --frozen but no cached index at {cache_path} - "
+                     f"run once without --frozen first")
+        with open(cache_path, "rb") as f:
+            raw_data = f.read()
+        return _apkindex_text(raw_data, version, repo, arch, output_dir)
+
+    req = urllib.request.Request(url)
+    if os.path.exists(cache_path) and os.path.exists(etag_path):
+        with open(etag_path) as f:
+            req.add_header("If-None-Match", f.read().strip())
+
+    try:
+        with urllib.request.urlopen(req) as resp:
             raw_data = resp.read()
-        # APKINDEX.tar.gz contains a single file, "APKINDEX", with the
-        # actual pipe-delimited package metadata we want to parse.
-        tf = tarfile.open(fileobj=io.BytesIO(raw_data), mode="r:gz")
-        member = tf.getmember("APKINDEX")
-        text = tf.extractfile(member).read().decode("utf-8", errors="replace")
-        # Cache the decoded text for next time.
-        with open(cache_path, "w", encoding="utf-8") as f:
-            f.write(text)
-    else:
-        # Already cached: just read the decoded text back from disk.
-        with open(cache_path, "r", encoding="utf-8", errors="replace") as f:
-            text = f.read()
+            etag = resp.headers.get("ETag")
+        sys.stderr.write(f"fetched {url}\n")
+        write_atomic(cache_path, raw_data)
+        if etag:
+            write_atomic(etag_path, etag.encode())
+        elif os.path.exists(etag_path):
+            os.remove(etag_path)
+    except urllib.error.HTTPError as e:
+        if e.code != 304:
+            raise
+        # Not modified since last run - the cached copy is current.
+        with open(cache_path, "rb") as f:
+            raw_data = f.read()
+
+    return _apkindex_text(raw_data, version, repo, arch, output_dir)
+
+
+def _apkindex_text(raw_data: bytes, version: str, repo: str, arch: str, output_dir: str) -> str:
+    """Decode a raw APKINDEX.tar.gz and, in mirror mode, make sure the
+    mirror's copy is these exact bytes. Shared by fetch_apkindex()'s
+    fresh/revalidated and --frozen paths."""
+    # APKINDEX.tar.gz contains a single file, "APKINDEX", with the actual
+    # package metadata we want to parse.
+    tf = tarfile.open(fileobj=io.BytesIO(raw_data), mode="r:gz")
+    member = tf.getmember("APKINDEX")
+    text = tf.extractfile(member).read().decode("utf-8", errors="replace")
 
     if output_dir:
-        # Mirror mode: also place a copy of the raw APKINDEX.tar.gz inside
-        # the output directory, at the same path convention used for the
-        # .apk files (v{version}/{repo}/{arch}/...).
+        # Mirror mode: also place the raw APKINDEX.tar.gz inside the output
+        # directory, at the same path convention used for the .apk files
+        # (v{version}/{repo}/{arch}/...).
         dest = os.path.join(output_dir, f"v{version}", repo, arch, "APKINDEX.tar.gz")
-        if not os.path.exists(dest):
+        current = None
+        if os.path.exists(dest):
+            with open(dest, "rb") as f:
+                current = f.read()
+        if current != raw_data:
             os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if raw_data is None:
-                # We served `text` from the local cache above, so we don't
-                # have the raw archive bytes in memory — re-download just
-                # the archive so we can place real bytes in the mirror.
-                url = f"{BASE_URL}/v{version}/{repo}/{arch}/APKINDEX.tar.gz"
-                sys.stderr.write(f"fetching {url} (for mirror)\n")
-                with urllib.request.urlopen(url) as resp:
-                    raw_data = resp.read()
-            with open(dest, "wb") as f:
-                f.write(raw_data)
+            write_atomic(dest, raw_data)
             sys.stderr.write(f"saved: v{version}/{repo}/{arch}/APKINDEX.tar.gz\n")
 
     return text
@@ -399,18 +440,25 @@ def build_relpath(entry, version):
     return os.path.join(f"v{version}", entry["repo"], entry["arch"], entry["filename"])
 
 
-def download_packages(resolved, version, output_dir, quiet=False):
+def download_packages(resolved, version, output_dir, quiet=False, frozen=False):
     """Download every resolved package's .apk file into `output_dir`,
     mirroring the v{version}/{repo}/{arch}/ layout used by the real repo.
 
     Skips a file if it already exists locally with the same size as the
     remote copy (checked via a HEAD request), so re-running the script is
-    cheap and safe to interrupt/resume.
+    cheap and safe to interrupt/resume. With `frozen`, an existing file is
+    trusted without the HEAD check - package filenames include the exact
+    version, and a frozen index can name packages dl-cdn has since deleted
+    (which would make the HEAD check 404 and trigger a doomed re-download).
 
     If `quiet` is True, the "skip (exists)" progress lines are suppressed
     (download and error messages are still printed, since those represent
     actual work/problems rather than routine no-ops).
+
+    Returns a list of (relpath, error) for every package that failed to
+    download
     """
+    failed = []
     total = len(resolved)
     for i, name in enumerate(sorted(resolved), 1):
         entry = resolved[name]
@@ -418,6 +466,11 @@ def download_packages(resolved, version, output_dir, quiet=False):
         relpath = build_relpath(entry, version)
         dest = os.path.join(output_dir, relpath)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
+
+        if os.path.exists(dest) and frozen:
+            if not quiet:
+                sys.stderr.write(f"[{i}/{total}] skip (exists, frozen): {relpath}\n")
+            continue
 
         if os.path.exists(dest):
             # File already present locally — check if it's already
@@ -436,11 +489,20 @@ def download_packages(resolved, version, output_dir, quiet=False):
 
         sys.stderr.write(f"[{i}/{total}] downloading: {relpath}\n")
         try:
-            urllib.request.urlretrieve(url, dest)
+            # Download to a temp name and rename, so a failed or
+            # interrupted download never leaves a partial .apk in place.
+            urllib.request.urlretrieve(url, dest + ".tmp")
+            os.replace(dest + ".tmp", dest)
         except Exception as e:
             # Don't let one failed package abort the whole run; report and
-            # keep going so the rest of the mirror still gets built.
+            # keep going so every failure shows up in one pass. main()
+            # still exits non-zero at the end.
             sys.stderr.write(f"  ERROR downloading {url}: {e}\n")
+            failed.append((relpath, e))
+            if os.path.exists(dest + ".tmp"):
+                os.remove(dest + ".tmp")
+
+    return failed
 
 
 def main():
@@ -470,6 +532,10 @@ def main():
     ap.add_argument("--assume-installed-file",
                      help="file with one 'assumed installed' package name per line "
                           "(same format as --file: blank lines and '#' comments skipped)")
+    ap.add_argument("--frozen", action="store_true",
+                     help="repeatable builds: use the cached APKINDEX without checking "
+                          "for an updated one, and trust .apk files already in --output-dir "
+                          "without re-checking them against the server")
     args = ap.parse_args()
 
     # Build the full wanted-package list from positional args plus,
@@ -495,7 +561,8 @@ def main():
     provides_priority = {}
     provides_candidates = {}
     for repo in repos:
-        text = fetch_apkindex(args.version, repo, args.arch, output_dir=args.output_dir)
+        text = fetch_apkindex(args.version, repo, args.arch, output_dir=args.output_dir,
+                              frozen=args.frozen)
         parse_apkindex(text, repo, args.arch, packages, provides_map,
                         provides_priority, provides_candidates)
 
@@ -522,9 +589,6 @@ def main():
         wanted, packages, provides_map, provides_candidates, preseed=baseline_resolved
     )
 
-    if unresolved:
-        sys.stderr.write(f"WARNING: could not resolve: {', '.join(sorted(unresolved))}\n")
-
     # Strip baseline packages back out of the result: they're assumed to
     # already be on the target, so they shouldn't be reported or
     # downloaded as "new" — only genuinely new packages should be.
@@ -544,9 +608,21 @@ def main():
 
     # Optionally download every resolved .apk (and the APKINDEX.tar.gz
     # files, handled inside fetch_apkindex above) into a local mirror.
+    failed = []
     if args.output_dir:
         os.makedirs(args.output_dir, exist_ok=True)
-        download_packages(resolved, args.version, args.output_dir, quiet=args.quiet)
+        failed = download_packages(resolved, args.version, args.output_dir, quiet=args.quiet,
+                                   frozen=args.frozen)
+
+    # Either of these means the target can't install what it was asked to
+    if unresolved or failed:
+        if failed:
+            sys.stderr.write(f"ERROR: {len(failed)} package(s) failed to download:\n")
+            for relpath, e in failed:
+                sys.stderr.write(f"  {relpath}: {e}\n")
+        if unresolved:
+            sys.stderr.write(f"ERROR: could not resolve: {', '.join(sorted(unresolved))}\n")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
